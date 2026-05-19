@@ -1,0 +1,5 @@
+monitor.db
+sitemap.xml
+__pycache__/
+*.pyc
+.venv/
