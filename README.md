@@ -49,7 +49,7 @@ python sitemap_generator.py https://example.com
 
 This will:
 
-1. Crawl `https://example.com` up to 500 pages (BFS, same domain only)
+1. Crawl `https://example.com` up to 1000 pages (BFS, same domain only)
 2. Save `sitemap.xml` in the current directory
 3. Automatically run the monitor — hashing every page and storing results in `monitor.db`
 
