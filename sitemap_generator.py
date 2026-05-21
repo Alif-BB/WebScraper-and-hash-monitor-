@@ -1,6 +1,7 @@
 """
 sitemap_generator.py
 A lightweight Python sitemap generator that crawls a website and outputs sitemap.xml.
+Now tracks parent-child relationships for BFS tree visualization.
 
 Dependencies:
     pip install requests beautifulsoup4
@@ -38,7 +39,10 @@ def normalize(url: str) -> str:
 
 
 def is_same_domain(url: str, base: str) -> bool:
-    return urlparse(url).netloc == urlparse(base).netloc
+    url_host = urlparse(url).netloc
+    base_host = urlparse(base).netloc
+    base_root = base_host.removeprefix("www.")
+    return url_host == base_host or url_host.endswith("." + base_root)
 
 
 def is_crawlable(url: str) -> bool:
@@ -57,11 +61,13 @@ def is_crawlable(url: str) -> bool:
 def crawl(start_url: str, max_pages: int) -> list[dict]:
     """
     BFS crawl starting from `start_url`.
-    Returns a list of dicts: {loc, lastmod, status}
+    Returns a list of dicts: {loc, lastmod, status, parent}
     """
     base = f"{urlparse(start_url).scheme}://{urlparse(start_url).netloc}"
     visited: set[str] = set()
-    queue: deque[str] = deque([normalize(start_url)])
+
+    # Queue now stores (url, parent) tuples
+    queue: deque[tuple[str, str | None]] = deque([(normalize(start_url), None)])
     results: list[dict] = []
 
     session = requests.Session()
@@ -70,7 +76,8 @@ def crawl(start_url: str, max_pages: int) -> list[dict]:
     print(f"🔍 Crawling {start_url} (max {max_pages} pages)…\n")
 
     while queue and len(results) < max_pages:
-        url = queue.popleft()
+        url, parent = queue.popleft()
+
         if url in visited:
             continue
         visited.add(url)
@@ -97,10 +104,10 @@ def crawl(start_url: str, max_pages: int) -> list[dict]:
             continue
 
         lastmod = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        results.append({"loc": url, "lastmod": lastmod, "status": status})
-        print(f"  ✓  {status}  {url}")
+        results.append({"loc": url, "lastmod": lastmod, "status": status, "parent": parent})
+        print(f"  ✓  {status}  {url}  (parent: {parent or 'root'})")
 
-        # Parse links
+        # Parse links and queue them with current url as parent
         soup = BeautifulSoup(resp.text, "html.parser")
         for tag in soup.find_all("a", href=True):
             href = tag["href"].strip()
@@ -112,7 +119,7 @@ def crawl(start_url: str, max_pages: int) -> list[dict]:
                 and abs_url not in visited
                 and is_crawlable(abs_url)
             ):
-                queue.append(abs_url)
+                queue.append((abs_url, url))  # record current page as parent
 
     print(f"\n✅ Done — {len(results)} pages found.\n")
     return results
@@ -134,6 +141,7 @@ def build_sitemap(pages: list[dict], output_path: str) -> None:
         ET.SubElement(url_el, "lastmod").text = page["lastmod"]
         ET.SubElement(url_el, "changefreq").text = "weekly"
         ET.SubElement(url_el, "priority").text = "0.8"
+        ET.SubElement(url_el, "parent").text = page["parent"] or ""  # save parent
 
     tree = ET.ElementTree(root)
     ET.indent(tree, space="  ")  # Pretty-print (Python 3.9+)
