@@ -19,6 +19,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from urllib.request import urlopen, Request
 from urllib.error import URLError
+from bs4 import BeautifulSoup
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -59,12 +60,23 @@ def get_db(path: str) -> sqlite3.Connection:
 # ── Hashing ───────────────────────────────────────────────────────────────────
 
 def fetch_and_hash(url: str) -> str | None:
-    """Fetch page content and return SHA-256 hex digest, or None on error."""
     try:
         req = Request(url, headers=HEADERS)
         with urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
             content = resp.read()
-        return hashlib.sha256(content).hexdigest()
+
+        # Parse and extract stable content only
+        soup = BeautifulSoup(content, "html.parser")
+
+        # Remove known dynamic elements
+        for tag in soup.find_all(["script", "style", "noscript"]):
+            tag.decompose()
+
+        # Get normalized text (strips whitespace differences too)
+        text = " ".join(soup.get_text().split())
+
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
     except URLError as e:
         print(f"  ⚠  Fetch error  {url}  ({e.reason})")
         return None
