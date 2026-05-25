@@ -1,8 +1,9 @@
 """
 monitor.py
 Hashes each page from sitemap.xml and stores/compares in SQLite.
+Uses concurrent requests for faster monitoring.
 
-Dependencies: none (stdlib only — sqlite3, hashlib, urllib)
+Dependencies: requests, beautifulsoup4
 
 Usage:
     python monitor.py                          # first run: snapshot all pages
@@ -13,12 +14,16 @@ Usage:
 """
 
 import argparse
+import fetch_changes
 import hashlib
 import sqlite3
+import threading
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from urllib.request import urlopen, Request
-from urllib.error import URLError
+from urllib.parse import urlparse
+
+import requests as req_lib
 from bs4 import BeautifulSoup
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -28,6 +33,9 @@ DEFAULT_SITEMAP = "sitemap.xml"
 SITEMAP_NS      = "http://www.sitemaps.org/schemas/sitemap/0.9"
 REQUEST_TIMEOUT = 10
 HEADERS         = {"User-Agent": "SitemapMonitor/1.0"}
+MAX_WORKERS     = 20  # concurrent threads for hashing
+DOC_EXTS        = {".pdf", ".pptx"}
+DOC_TYPES       = {"application/pdf", "application/vnd.openxmlformats-officedocument.presentationml.presentation"}
 
 
 # ── Database ──────────────────────────────────────────────────────────────────
@@ -61,9 +69,18 @@ def get_db(path: str) -> sqlite3.Connection:
 
 def fetch_and_hash(url: str) -> str | None:
     try:
-        req = Request(url, headers=HEADERS)
-        with urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
-            content = resp.read()
+        is_doc = any(urlparse(url).path.lower().endswith(ext) for ext in DOC_EXTS)
+
+        if is_doc:
+            # HEAD request only — avoid downloading full file body
+            resp = req_lib.head(url, headers=HEADERS, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+            last_modified  = resp.headers.get("Last-Modified", "")
+            content_length = resp.headers.get("Content-Length", "")
+            fingerprint    = f"{url}|{last_modified}|{content_length}"
+            return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
+
+        resp    = req_lib.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+        content = resp.content
 
         # Parse and extract stable content only
         soup = BeautifulSoup(content, "html.parser")
@@ -72,13 +89,19 @@ def fetch_and_hash(url: str) -> str | None:
         for tag in soup.find_all(["script", "style", "noscript"]):
             tag.decompose()
 
+        # Remove visitor counters (Online/Today/Total counters that change every request)
+        import re
+        for node in soup.find_all(string=re.compile(r"Online\s*:", re.IGNORECASE)):
+            if node.parent:
+                node.parent.decompose()
+
         # Get normalized text (strips whitespace differences too)
         text = " ".join(soup.get_text().split())
 
         return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
-    except URLError as e:
-        print(f"  ⚠  Fetch error  {url}  ({e.reason})")
+    except Exception as e:
+        print(f"  ⚠  Fetch error  {url}  ({e})")
         return None
 
 
@@ -87,7 +110,6 @@ def fetch_and_hash(url: str) -> str | None:
 def read_urls(sitemap_path: str) -> list[str]:
     tree = ET.parse(sitemap_path)
     root = tree.getroot()
-    # handle both namespaced and plain <loc> tags
     urls = [el.text.strip() for el in root.findall(f".//{{{SITEMAP_NS}}}loc") if el.text]
     if not urls:
         urls = [el.text.strip() for el in root.findall(".//loc") if el.text]
@@ -110,10 +132,32 @@ def run(sitemap_path: str, db_path: str) -> None:
     unchanged     = 0
     error_count   = 0
 
-    print(f"🔍 Checking {len(urls)} URLs from {sitemap_path}\n")
+    print(f"🔍 Checking {len(urls)} URLs from {sitemap_path} ({MAX_WORKERS} workers)\n")
+
+    # ── Phase 1: fetch and hash all URLs concurrently ─────────────────────────
+    hash_results: dict[str, str | None] = {}
+    print_lock = threading.Lock()
+
+    def fetch_and_report(url: str) -> tuple[str, str | None]:
+        result = fetch_and_hash(url)
+        with print_lock:
+            if result is None:
+                print(f"  ⚠  Error    {url}")
+            else:
+                print(f"  ✓  Hashed   {url}")
+        return url, result
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(fetch_and_report, url): url for url in urls}
+        for future in as_completed(futures):
+            url, result = future.result()
+            hash_results[url] = result
+
+    # ── Phase 2: compare and write to DB sequentially ────────────────────────
+    print(f"\n📝 Updating database...\n")
 
     for url in urls:
-        new_hash = fetch_and_hash(url)
+        new_hash = hash_results.get(url)
 
         if new_hash is None:
             error_count += 1
@@ -177,6 +221,8 @@ def run(sitemap_path: str, db_path: str) -> None:
 
     if changed_count:
         print(f"⚠️  {changed_count} page(s) changed since last run.")
+        print("\n🔎 Fetching HTML snapshots for changed pages...\n")
+        fetch_changes.run(db_path)
     else:
         print("✅ No changes detected.")
 
@@ -226,6 +272,8 @@ def main() -> None:
                         help=f"SQLite database path (default: {DEFAULT_DB})")
     parser.add_argument("--report", action="store_true",
                         help="Print a summary of the database without crawling")
+    parser.add_argument("--workers", type=int, default=MAX_WORKERS,
+                        help=f"Number of concurrent workers (default: {MAX_WORKERS})")
     args = parser.parse_args()
 
     if args.report:
