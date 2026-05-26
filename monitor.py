@@ -14,6 +14,7 @@ Usage:
 """
 
 import argparse
+import re
 import fetch_changes
 import hashlib
 import sqlite3
@@ -66,13 +67,11 @@ def get_db(path: str) -> sqlite3.Connection:
 
 
 # ── Hashing ───────────────────────────────────────────────────────────────────
-
 def fetch_and_hash(url: str) -> str | None:
     try:
         is_doc = any(urlparse(url).path.lower().endswith(ext) for ext in DOC_EXTS)
 
         if is_doc:
-            # HEAD request only — avoid downloading full file body
             resp = req_lib.head(url, headers=HEADERS, timeout=REQUEST_TIMEOUT, allow_redirects=True)
             last_modified  = resp.headers.get("Last-Modified", "")
             content_length = resp.headers.get("Content-Length", "")
@@ -82,28 +81,39 @@ def fetch_and_hash(url: str) -> str | None:
         resp    = req_lib.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT, allow_redirects=True)
         content = resp.content
 
-        # Parse and extract stable content only
         soup = BeautifulSoup(content, "html.parser")
 
-        # Remove known dynamic elements
+        # Remove scripts, styles, noscript
         for tag in soup.find_all(["script", "style", "noscript"]):
             tag.decompose()
 
-        # Remove visitor counters (Online/Today/Total counters that change every request)
-        import re
+        # Remove visitor counters (Online/Today/Total)
         for node in soup.find_all(string=re.compile(r"Online\s*:", re.IGNORECASE)):
             if node.parent:
                 node.parent.decompose()
 
-        # Get normalized text (strips whitespace differences too)
-        text = " ".join(soup.get_text().split())
+        # Remove session ID label (use get_text() — nested spans break string= matching)
+        for label in soup.find_all("label"):
+            if re.search(r"Session Id", label.get_text(), re.IGNORECASE):
+                label.decompose()
 
+        # Remove the hidden error dialog that embeds a live timestamp on every load.
+        # find_all(id=...) breaks on IDs with colons — use attrs={} instead.
+        for dialog in soup.find_all(attrs={"id": "commonExceptionHandlerDialogForm:commonExceptionHandlerDialog"}):
+            dialog.decompose()
+
+        # Fallback: strip any remaining dd-mm-yyyy hh:mm:ss timestamp text nodes
+        for node in soup.find_all(string=re.compile(r"\d{2}-\d{2}-\d{4} \d{2}:\d{2}:\d{2}")):
+            if node.parent:
+                node.parent.decompose()
+
+        # Normalize and hash
+        text = " ".join(soup.get_text().split())
         return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
     except Exception as e:
         print(f"  ⚠  Fetch error  {url}  ({e})")
         return None
-
 
 # ── Sitemap reader ────────────────────────────────────────────────────────────
 

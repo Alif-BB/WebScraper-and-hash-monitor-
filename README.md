@@ -6,6 +6,12 @@ Zero external dependencies for the monitor. Only `requests` and `beautifulsoup4`
 
 ---
 
+## Architecture
+
+![Architecture diagram](webscraper_architecture_v3.svg)
+
+---
+
 ## Project Structure
 
 ```
